@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+    --color-neon-green: #00ff9d;
+    --color-neon-blue: #00d2ff;
+    --color-neon-purple: #bc13fe;
+
+    --color-dark-bg: #0a0a0f;
+    --color-dark-card: #13131f;
+    --color-dark-surface: #1c1c2e;
+}
+
+@layer base {
+    body {
+        @apply bg-dark-bg text-white font-sans overflow-x-hidden;
+    }
+}
+
+@layer utilities {
+    .glass {
+        @apply bg-white/5 backdrop-blur-lg border border-white/10;
+    }
+
+    .glass-card {
+        @apply bg-dark-card/80 backdrop-blur-md border border-white/5 hover:border-neon-green/50 transition-all duration-300;
+    }
+
+    .neon-text {
+        text-shadow: 0 0 10px rgba(0, 255, 157, 0.5);
+    }
+
+    .neon-box {
+        box-shadow: 0 0 20px rgba(0, 255, 157, 0.1);
+    }
+}

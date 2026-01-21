@@ -284,7 +284,7 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
     early_stopping = EarlyStopping(patience=50 if not debug else 1000, path=save_path) if not (debug and not pretrain) else None
     
     # 5. Training Loop
-    epochs = 100 if pretrain else (1000 if not debug else 500)
+    epochs = 100 if pretrain else 150
     
     # History for plotting
     history = {

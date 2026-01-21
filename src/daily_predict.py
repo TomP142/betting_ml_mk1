@@ -52,33 +52,40 @@ def load_resources(target_player_id: int = None):
     return model, player_encoder, team_encoder, scaler, feature_cols
 
 def predict_daily(target_player_id: int = None, date_input: str = None, stars_out: int = None, missing_ids: str = None):
+    results_list = []
     try:
         model, p_enc, t_enc, scaler, feature_cols = load_resources(target_player_id)
         fe = FeatureEngineer()
         
         # 1. Get History Data
-        print("Fetching historical data...")
+        # print("Fetching historical data...") # Silence for API
         df_history = fe.load_all_data()
         
         # 2. Determine Target Date & Game Context
         target_date = date_input if date_input else datetime.now().strftime('%Y-%m-%d')
-        print(f"Target Date: {target_date}")
+        # print(f"Target Date: {target_date}")
         
-        # ... (Same logic for scoreboard fetching) ...
-        # Fetch Scoreboard for Target Date to find Opponent
+        # Fetch Scoreboard
         scoreboard = fetch_daily_scoreboard(target_date)
         
         if scoreboard.empty:
             print(f"No games found for date {target_date}")
-            return
+            return []
 
-        # Find match for our player
+        # Logic to handle "All Players" vs "Single Player"
+        # If target_player_id is set, we process just that one.
+        # If NOT set, checking ALL players is hard because `load_resources` might load a specific model or generic.
+        # For "Today's Bets", we likely want to iterate over ALL players in the scoreboard?
+        
+        # For now, let's keep the existing logic: If target_player_id is provided, predict for him.
+        # The API will handle the iteration and calls.
+        
         if target_player_id:
             # Filter history to just this player to find their Team ID
             player_history = df_history[df_history['PLAYER_ID'] == target_player_id].sort_values('GAME_DATE')
             if player_history.empty:
                 print(f"Player {target_player_id} not found in history.")
-                return
+                return []
                 
             last_game = player_history.iloc[-1]
             team_id = last_game['TEAM_ID']
@@ -88,29 +95,32 @@ def predict_daily(target_player_id: int = None, date_input: str = None, stars_ou
             game = scoreboard[(scoreboard['HOME_TEAM_ID'] == team_id) | (scoreboard['VISITOR_TEAM_ID'] == team_id)]
             
             if game.empty:
-                print(f"No game found for {player_name} (Team {team_id}) on {target_date}.")
-                return
+                # print(f"No game found for {player_name} (Team {team_id}) on {target_date}.")
+                return []
                 
             game = game.iloc[0]
             is_home = game['HOME_TEAM_ID'] == team_id
             opp_id = game['VISITOR_TEAM_ID'] if is_home else game['HOME_TEAM_ID']
             
-            # Get Opponent Abbreviation
+            # Get Team Abbreviations
             from nba_api.stats.static import teams
             try:
                 opp_info = teams.find_team_name_by_id(opp_id)
                 opp_abbr = opp_info['abbreviation']
-            except:
-                print(f"Could not resolve opponent ID {opp_id}")
-                return
                 
-            print(f"Matchup: {player_name} vs {opp_abbr} ({'Home' if is_home else 'Away'})")
+                own_info = teams.find_team_name_by_id(team_id)
+                own_abbr = own_info['abbreviation']
+            except:
+                opp_abbr = "UNK"
+                own_abbr = "UNK"
+                
+            # print(f"Matchup: {player_name} vs {opp_abbr} ({'Home' if is_home else 'Away'})")
             
             # Create Phantom Row
             new_row = {
                 'PLAYER_ID': target_player_id,
                 'GAME_DATE': target_date,
-                'MATCHUP': f"??? vs. {opp_abbr}",
+                'MATCHUP': f"{own_abbr} vs. {opp_abbr}",
                 'TEAM_ID': team_id,
                 'PTS': np.nan, 'REB': np.nan, 'AST': np.nan,
                 'MIN': 0, 'FGA': 0,
@@ -119,101 +129,74 @@ def predict_daily(target_player_id: int = None, date_input: str = None, stars_ou
             
             df_history = pd.concat([df_history, pd.DataFrame([new_row])], ignore_index=True)
             
-        
-        # 3. Process
-        print(f"Processing features...")
-        
-        overrides = {}
-        if target_player_id and stars_out is not None:
-             overrides[(target_player_id, target_date)] = {'STARS_OUT': stars_out}
-             
-        # Note: missing_ids override is handled by passing to model directly, OR we can override feature column if it existed?
-        # But MISSING_PLAYER_IDS is handled by `train_models.py` preprocessing, NOT `feature_engineer.py` scaler.
-        # So we process it HERE manually to create tensor.
-        
-        df_processed = fe.process(df_history, is_training=False, overrides=overrides)
-        
-        # 4. Extract Target Row & OVERRIDE STARS_OUT
-        if target_player_id:
-             target_dt = pd.to_datetime(target_date)
-             mask = (df_processed['PLAYER_ID'] == target_player_id) & (df_processed['GAME_DATE'] == target_dt)
-             
-             # Apply Manual Override for Stars Out
-             if stars_out is not None:
-                 print(f"Overriding STARS_OUT to {stars_out}")
-             
-             latest_stats = df_processed[mask].copy()
-        else:
-             latest_stats = df_processed[df_processed['GAME_DATE'] == pd.to_datetime(target_date)].copy()
-        
-        if latest_stats.empty:
-            print("Error: Could not generate processed features for target date.")
-            return
-
-        # 5. Predict
-        # Prepare Tensors
-        p_idx = torch.LongTensor(latest_stats['PLAYER_IDX'].values).to(device)
-        t_idx = torch.LongTensor(latest_stats['TEAM_IDX'].values).to(device)
-        x_cont = torch.FloatTensor(latest_stats[feature_cols].values).to(device)
-        
-        # Prepare Missing IDs Tensor
-        # Pad Index = Last Class
-        pad_idx = len(p_enc.classes_) # Same as num_players in init?
-        # Check NBAPredictor init: padding_idx=num_players-1. wait.
-        # In train_models: num_players = len(classes) + 1.
-        # So padding index is `len(classes)`. Correct.
-        
-        max_missing = 3
-        m_indices = []
-        
-        if missing_ids:
-            # Parse inputs: "123_456"
-            ids = missing_ids.split('_')
-            for pid_str in ids:
-                # Encoder expects STRINGS
-                # Check if pid_str is in classes
-                if pid_str in p_enc.classes_:
-                    encoded = p_enc.transform([pid_str])[0]
-                    m_indices.append(encoded)
-                else:
-                    print(f"Warning: Missing Player ID {pid_str} not in encoder. Ignoring.")
-                    
-        # Pad
-        if len(m_indices) > max_missing:
-            m_indices = m_indices[:max_missing]
-        else:
-            m_indices += [pad_idx] * (max_missing - len(m_indices))
+            # 3. Process
+            # print(f"Processing features...")
             
-        # Create tensor and expand to match batch size
-        batch_size = len(latest_stats)
-        m_idx_tensor = torch.LongTensor([m_indices] * batch_size).to(device) # Shape (B, 3)
-        
-        # Predict
-        print(f"Predicting with Missing Indices: {m_indices} (Batch Size: {batch_size})...")
-        with torch.no_grad():
-            preds = model(p_idx, t_idx, x_cont, m_idx_tensor)
+            overrides = {}
+            if stars_out is not None:
+                 overrides[(target_player_id, target_date)] = {'STARS_OUT': stars_out}
             
-        preds_np = preds.cpu().numpy()
-        
-        # Save/Print
-        results = latest_stats[['PLAYER_ID', 'GAME_DATE', 'MATCHUP']].copy()
-        if stars_out is not None:
-             results['STARS_OUT (Override)'] = stars_out
-        
-        results['PRED_PTS'] = preds_np[:, 0]
-        results['PRED_REB'] = preds_np[:, 1]
-        results['PRED_AST'] = preds_np[:, 2]
-        
-        print("\nPrediction Results:")
-        print(results.to_string(index=False))
-        
-        out_path = os.path.join(DATA_DIR, f'predictions_{target_player_id if target_player_id else "all"}_{datetime.now().strftime("%Y%m%d")}.csv')
-        results.to_csv(out_path, index=False)
-        
+            df_processed = fe.process(df_history, is_training=False, overrides=overrides)
+            
+            # 4. Extract Target Row
+            target_dt = pd.to_datetime(target_date)
+            mask = (df_processed['PLAYER_ID'] == target_player_id) & (df_processed['GAME_DATE'] == target_dt)
+            latest_stats = df_processed[mask].copy()
+            
+            if latest_stats.empty:
+                return []
+    
+            # 5. Predict
+            p_idx = torch.LongTensor(latest_stats['PLAYER_IDX'].values).to(device)
+            t_idx = torch.LongTensor(latest_stats['TEAM_IDX'].values).to(device)
+            x_cont = torch.FloatTensor(latest_stats[feature_cols].values).to(device)
+            
+            pad_idx = len(p_enc.classes_)
+            max_missing = 3
+            m_indices = []
+            
+            if missing_ids:
+                ids = missing_ids.split('_')
+                for pid_str in ids:
+                    if pid_str in p_enc.classes_:
+                        encoded = p_enc.transform([pid_str])[0]
+                        m_indices.append(encoded)
+                        
+            if len(m_indices) > max_missing:
+                m_indices = m_indices[:max_missing]
+            else:
+                m_indices += [pad_idx] * (max_missing - len(m_indices))
+                
+            batch_size = len(latest_stats)
+            m_idx_tensor = torch.LongTensor([m_indices] * batch_size).to(device)
+            
+            with torch.no_grad():
+                preds = model(p_idx, t_idx, x_cont, m_idx_tensor)
+                
+            preds_np = preds.cpu().numpy()
+            
+            # Build Result Dict
+            res = latest_stats[['PLAYER_ID', 'GAME_DATE', 'MATCHUP']].iloc[0].to_dict()
+            res['PLAYER_NAME'] = player_name
+            res['PRED_PTS'] = float(preds_np[0, 0])
+            res['PRED_REB'] = float(preds_np[0, 1])
+            res['PRED_AST'] = float(preds_np[0, 2])
+            res['OPPONENT'] = opp_abbr
+            res['IS_HOME'] = bool(is_home)
+            res['GAME_DATE'] = str(res['GAME_DATE']) # Serialization
+            
+            results_list.append(res)
+            
+            # Legacy CSV Save (Optional, can remove if interfering)
+            # out_path = os.path.join(DATA_DIR, f'predictions_{target_player_id}_{datetime.now().strftime("%Y%m%d")}.csv')
+            # pd.DataFrame([res]).to_csv(out_path, index=False)
+            
     except Exception as e:
         print(f"Prediction failed: {e}")
         import traceback
         traceback.print_exc()
+        
+    return results_list
 
 if __name__ == "__main__":
     import argparse
