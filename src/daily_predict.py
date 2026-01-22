@@ -39,11 +39,11 @@ def load_resources(target_player_id: int = None):
             model.load_state_dict(torch.load(specific_path, map_location=device)) # weights_only=True removed as it's not a standard arg for torch.load
         else:
             print(f"Specific model not found. Loading generic model...")
-            generic_path = os.path.join(MODELS_DIR, 'pytorch_nba.pth')
+            generic_path = os.path.join(MODELS_DIR, 'pytorch_nba_global.pth')
             model.load_state_dict(torch.load(generic_path, map_location=device)) # weights_only=True removed
     else:
         print("Loading generic model...")
-        generic_path = os.path.join(MODELS_DIR, 'pytorch_nba.pth')
+        generic_path = os.path.join(MODELS_DIR, 'pytorch_nba_global.pth')
         model.load_state_dict(torch.load(generic_path, map_location=device)) # weights_only=True removed
         
     model.to(device)
@@ -176,14 +176,78 @@ def predict_daily(target_player_id: int = None, date_input: str = None, stars_ou
             preds_np = preds.cpu().numpy()
             
             # Build Result Dict
+            # Load Metrics
+            mae_pts = 6.0
+            mae_reb = 2.5
+            mae_ast = 2.0
+            
+            try:
+                import json
+                # Try specific metrics
+                m_path = os.path.join(MODELS_DIR, f'metrics_player_{target_player_id}.json')
+                if not os.path.exists(m_path):
+                     m_path = os.path.join(MODELS_DIR, 'metrics_global.json')
+                     
+                if os.path.exists(m_path):
+                    with open(m_path, 'r') as f:
+                        metrics = json.load(f)
+                        mae_pts = metrics.get('mae_pts', 6.0)
+                        mae_reb = metrics.get('mae_reb', 2.5)
+                        mae_ast = metrics.get('mae_ast', 2.0)
+            except:
+                pass
+
             res = latest_stats[['PLAYER_ID', 'GAME_DATE', 'MATCHUP']].iloc[0].to_dict()
             res['PLAYER_NAME'] = player_name
-            res['PRED_PTS'] = float(preds_np[0, 0])
-            res['PRED_REB'] = float(preds_np[0, 1])
-            res['PRED_AST'] = float(preds_np[0, 2])
+            
+            # Base
+            p_pts = float(preds_np[0, 0])
+            p_reb = float(preds_np[0, 1])
+            p_ast = float(preds_np[0, 2])
+            
+            res['PRED_PTS'] = p_pts
+            res['PRED_REB'] = p_reb
+            res['PRED_AST'] = p_ast
+            
+            # Combos
+            res['PRED_PRA'] = p_pts + p_reb + p_ast
+            res['PRED_PR'] = p_pts + p_reb
+            res['PRED_PA'] = p_pts + p_ast
+            res['PRED_RA'] = p_reb + p_ast
+            
+            # MAEs
+            mae_pra = mae_pts + mae_reb + mae_ast
+            mae_pr = mae_pts + mae_reb
+            mae_pa = mae_pts + mae_ast
+            mae_ra = mae_reb + mae_ast
+            
+            # Lines
+            res['LINE_PTS_LOW'] = p_pts - mae_pts
+            res['LINE_PTS_HIGH'] = p_pts + mae_pts
+            
+            res['LINE_REB_LOW'] = p_reb - mae_reb
+            res['LINE_REB_HIGH'] = p_reb + mae_reb
+            
+            res['LINE_AST_LOW'] = p_ast - mae_ast
+            res['LINE_AST_HIGH'] = p_ast + mae_ast
+            
+            res['LINE_PRA_LOW'] = res['PRED_PRA'] - mae_pra
+            res['LINE_PRA_HIGH'] = res['PRED_PRA'] + mae_pra
+            
             res['OPPONENT'] = opp_abbr
             res['IS_HOME'] = bool(is_home)
             res['GAME_DATE'] = str(res['GAME_DATE']) # Serialization
+            
+            print("Prediction Results:")
+            print(f" PLAYER_ID  GAME_DATE     MATCHUP  PRED_PTS  PRED_REB  PRED_AST")
+            print(f"{target_player_id:>10} {res['GAME_DATE']} {res['MATCHUP']} {p_pts:<6.2f}    {p_reb:<6.2f}    {p_ast:<6.2f}")
+            print(f"Combos -> PRA: {res['PRED_PRA']:.2f} | PR: {res['PRED_PR']:.2f} | PA: {res['PRED_PA']:.2f}")
+            print("-" * 60)
+            print(f"Betting Lines (Safe Zones):")
+            print(f"PTS: Under {res['LINE_PTS_HIGH']:.1f} / Over {res['LINE_PTS_LOW']:.1f} (MAE: {mae_pts:.1f})")
+            print(f"REB: Under {res['LINE_REB_HIGH']:.1f} / Over {res['LINE_REB_LOW']:.1f} (MAE: {mae_reb:.1f})")
+            print(f"AST: Under {res['LINE_AST_HIGH']:.1f} / Over {res['LINE_AST_LOW']:.1f} (MAE: {mae_ast:.1f})")
+            print(f"PRA: Under {res['LINE_PRA_HIGH']:.1f} / Over {res['LINE_PRA_LOW']:.1f}")
             
             results_list.append(res)
             

@@ -64,7 +64,31 @@ class BatchPredictor:
         model.eval()
         
         self.models_cache[path_to_load] = model
+        self.models_cache[path_to_load] = model
         return model
+
+    def _get_metrics(self, player_id: int):
+        """Loads MAE metrics for confidence intervals."""
+        specific_path = os.path.join(MODELS_DIR, f'metrics_player_{player_id}.json')
+        generic_path = os.path.join(MODELS_DIR, 'metrics_global.json')
+        
+        path_to_load = specific_path if os.path.exists(specific_path) else generic_path
+        
+        # Default fallback
+        metrics = {
+            'mae_pts': 6.0, 'mae_reb': 2.5, 'mae_ast': 2.0,
+            'baseline_pts': 7.0, 'baseline_reb': 3.0, 'baseline_ast': 2.5
+        }
+        
+        try:
+            import json
+            if os.path.exists(path_to_load):
+                with open(path_to_load, 'r') as f:
+                    metrics = json.load(f)
+        except:
+             pass
+             
+        return metrics
 
     async def analyze_today_batch(self, date_input: str = None, execution_list: list = None, log_manager=None):
         """
@@ -158,6 +182,13 @@ class BatchPredictor:
         
         total_p = len(execution_list)
         
+        # Pre-calculate Last Played Dates for Recency Filter
+        # Ensure datetime
+        df_history['GAME_DATE'] = pd.to_datetime(df_history['GAME_DATE'])
+        last_played_map = df_history.groupby('PLAYER_ID')['GAME_DATE'].max().to_dict()
+        
+        target_dt = pd.to_datetime(target_date)
+        
         if log_manager: await log_manager.broadcast("Inferencing Models...")
         
         processed_count = 0
@@ -165,6 +196,22 @@ class BatchPredictor:
         for item in execution_list:
             pid = item['pid']
             pname = item['pname']
+            
+            # RECENTLY ACTIVE CHECK
+            # If player hasn't played in > 30 days, skip.
+            last_date = last_played_map.get(pid)
+            if last_date:
+                days_inactive = (target_dt - last_date).days
+                if days_inactive > 30:
+                    # print(f"Skipping {pname} - Inactive for {days_inactive} days")
+                    continue
+            else:
+                 # No history at all? Skip or keep?
+                 # If no history, they are probably a rookie or new. Keep them or skip?
+                 # If we have no history, we can't predict well anyway (using generic).
+                 # Let's keep them if they are in the roster, maybe?
+                 # Actually, if they have NO games in df_history (which covers multiple years), they are likely irrelevant or very new.
+                 pass
             
             # Get row
             # mask = today_data['PLAYER_ID'] == pid ... fast enough?
@@ -205,14 +252,77 @@ class BatchPredictor:
                 
             preds_np = preds.cpu().numpy()
             
+            # Get Metrics for confidence
+            metrics = self._get_metrics(pid)
+            mae_pts = metrics.get('mae_pts', 6.0)
+            mae_reb = metrics.get('mae_reb', 2.5)
+            mae_ast = metrics.get('mae_ast', 2.0)
+            
+            # 1. Combos
+            pred_pts = float(preds_np[0, 0])
+            pred_reb = float(preds_np[0, 1])
+            pred_ast = float(preds_np[0, 2])
+            
+            pred_pra = pred_pts + pred_reb + pred_ast
+            pred_pr = pred_pts + pred_reb
+            pred_pa = pred_pts + pred_ast
+            pred_ra = pred_reb + pred_ast
+            
+            # Combos MAE (Sum for conservative estimate, or Sqrt for variance)
+            # User wants "Expected error". Sum is safe upper bound. Sqrt is statistical.
+            # Let's use Sum to be conservative for "Good Lines".
+            mae_pra = mae_pts + mae_reb + mae_ast
+            mae_pr = mae_pts + mae_reb
+            mae_pa = mae_pts + mae_ast
+            mae_ra = mae_reb + mae_ast
+
+            # FILTER: Exclude Inactive Players
+            # If the model predicts ~0 stats, the player is likely injured/out.
+            if pred_pra < 1.0:
+                # print(f"Skipping {pname} (PRA: {pred_pra:.2f}) - Likely Inactive")
+                continue
+
             res = {
                 'PLAYER_ID': pid,
                 'PLAYER_NAME': pname,
                 'GAME_DATE': target_date,
                 'MATCHUP': player_row['MATCHUP'].iloc[0],
-                'PRED_PTS': float(preds_np[0, 0]),
-                'PRED_REB': float(preds_np[0, 1]),
-                'PRED_AST': float(preds_np[0, 2]),
+                
+                # Base Preds
+                'PRED_PTS': pred_pts,
+                'PRED_REB': pred_reb,
+                'PRED_AST': pred_ast,
+                
+                # Combos
+                'PRED_PRA': pred_pra,
+                'PRED_PR': pred_pr,
+                'PRED_PA': pred_pa,
+                'PRED_RA': pred_ra,
+                
+                # Betting Lines (The "Good" zone)
+                # If Bookmaker Line is < Low, Bet Over.
+                # If Bookmaker Line is > High, Bet Under.
+                
+                # PTS
+                'LINE_PTS_LOW': pred_pts - mae_pts,
+                'LINE_PTS_HIGH': pred_pts + mae_pts,
+                'MAE_PTS': mae_pts,
+                
+                # REB
+                'LINE_REB_LOW': pred_reb - mae_reb,
+                'LINE_REB_HIGH': pred_reb + mae_reb,
+                'MAE_REB': mae_reb,
+                
+                # AST
+                'LINE_AST_LOW': pred_ast - mae_ast,
+                'LINE_AST_HIGH': pred_ast + mae_ast,
+                'MAE_AST': mae_ast,
+                
+                # PRA
+                'LINE_PRA_LOW': pred_pra - mae_pra,
+                'LINE_PRA_HIGH': pred_pra + mae_pra,
+                'MAE_PRA': mae_pra,
+                
                 'OPPONENT': player_row['OPP_TEAM_ABBREVIATION'].iloc[0],
                 'IS_HOME': item.get('is_home', False)
             }

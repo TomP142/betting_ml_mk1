@@ -7,6 +7,7 @@ import numpy as np
 import os
 import joblib
 from sklearn.model_selection import train_test_split
+from datetime import datetime
 
 # Constants
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
@@ -464,14 +465,33 @@ def train_model(target_player_id: int = None, debug: bool = False, pretrain: boo
             plt.savefig(plot_path)
             print(f"Final plot saved to {plot_path}")
             plt.ioff()
-            # plt.show() # Optional: keep window open. But might block script exit. 
-            # Better to just save and close.
             plt.close()
     else:
         model.load_state_dict(torch.load(save_path))
         print(f"\nFinal Best Model Saved to {save_path}")
         
     print(f"Final Validation Scores -> PTS MAE: {mae_pts:.4f} (Baseline: {baseline_mae_pts:.4f})")
+    
+    # Save Metrics to JSON
+    import json
+    metrics = {
+        'mae_pts': float(mae_pts),
+        'mae_reb': float(mae_reb),
+        'mae_ast': float(mae_ast),
+        'baseline_pts': float(baseline_mae_pts),
+        'baseline_reb': float(baseline_mae_reb),
+        'baseline_ast': float(baseline_mae_ast),
+        'date': datetime.now().strftime('%Y-%m-%d')
+    }
+    
+    if pretrain:
+        metrics_path = os.path.join(DATA_DIR, 'models', 'metrics_global.json')
+    else:
+        metrics_path = os.path.join(DATA_DIR, 'models', f'metrics_player_{target_player_id}.json')
+        
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=4)
+    print(f"Metrics saved to {metrics_path}")
 
 if __name__ == "__main__":
     import argparse
